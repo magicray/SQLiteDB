@@ -41,7 +41,6 @@ class S3Bucket:
             (time.time()-ts) * 1000)
 
 
-S3 = None
 PYTYPES = dict(i=(int,), f=(int, float), t=(str,), b=(str, bytes))
 SQLTYPES = dict(i='int', f='float', t='text', b='blob')
 
@@ -63,9 +62,10 @@ def validate_types(values):
 
 
 class Database:
-    def __init__(self, db):
-        self.log = json.loads(S3.get('log.json'))
-        self.log_buffer = list()
+    def __init__(self, db, s3):
+        self.s3 = s3
+        self.log = json.loads(self.s3.get('log.json'))
+        self.txns = list()
 
         self.conn = sqlite3.connect(db)
         self.conn.execute('pragma journal_mode=wal')
@@ -81,7 +81,7 @@ class Database:
 
         for i in range(lsn+1, self.log['total']+1):
             cur = self.conn.cursor()
-            txn = pickle.loads(S3.get('logs/' + str(i)))
+            txn = pickle.loads(self.s3.get('logs/' + str(i)))
 
             for sql, params in txn:
                 cur.execute(sql, params)
@@ -98,24 +98,24 @@ class Database:
     def commit(self):
         self.log['total'] += 1
 
-        S3.put('logs/' + str(self.log['total']), pickle.dumps(self.log_buffer))
-        S3.put('log.json', json.dumps(self.log), 'application/json')
+        self.s3.put('logs/' + str(self.log['total']), pickle.dumps(self.txns))
+        self.s3.put('log.json', json.dumps(self.log), 'application/json')
 
         self.conn.execute("update _kv set value=? where key='lsn'",
                           [self.log['total']])
         self.conn.commit()
 
-        self.log_buffer = list()
+        self.txns = list()
 
     def execute(self, sql, params=dict()):
         try:
             cur = self.conn.cursor()
-            self.log_buffer.append((sql, params))
+            self.txns.append((sql, params))
             cur.execute(sql, params)
             log('modified(%d) %s', cur.rowcount, sql)
             cur.close()
         except Exception as e:
-            self.log_buffer = None
+            self.txns = None
             self.conn.rollback()
             self.conn.close()
             self.conn = None
@@ -178,8 +178,32 @@ class Database:
         self.execute('delete from {} where {}'.format(table, where), params)
 
 
-def main(args):
-    db = Database(args.db)
+def main():
+    logging.basicConfig(format='%(asctime)s %(process)d : %(message)s')
+
+    args = argparse.ArgumentParser()
+
+    args.add_argument(
+        '--config', default='config.json',
+        help='Object bucket configuration')
+
+    args.add_argument('--db', help='Database Name')
+    args.add_argument('--table', help='Table Name')
+    args.add_argument('operation', help='Operation to be done')
+
+    args.add_argument('--src', help='Old column name')
+    args.add_argument('--dst', help='New column name')
+    args.add_argument('--column', help='Column name')
+    args.add_argument('--primary_key', help='Comma separated column list')
+
+    args = args.parse_args()
+
+    with open(args.config) as fd:
+        conf = json.load(fd)
+        s3 = S3Bucket(conf['s3bucket'], conf['s3bucket_auth_key'],
+                      conf['s3bucket_auth_secret'])
+
+    db = Database(args.db, s3)
 
     if 'create' == args.operation:
         db.create(args.table, args.primary_key.split(','))
@@ -210,28 +234,4 @@ def main(args):
 
 
 if __name__ == '__main__':
-    logging.basicConfig(format='%(asctime)s %(process)d : %(message)s')
-
-    ARGS = argparse.ArgumentParser()
-
-    ARGS.add_argument(
-        '--config', default='config.json',
-        help='Object bucket configuration')
-
-    ARGS.add_argument('--db', help='Database Name')
-    ARGS.add_argument('--table', help='Table Name')
-    ARGS.add_argument('operation', help='Operation to be done')
-
-    ARGS.add_argument('--src', help='Old column name')
-    ARGS.add_argument('--dst', help='New column name')
-    ARGS.add_argument('--column', help='Column name')
-    ARGS.add_argument('--primary_key', help='Comma separated column list')
-
-    ARGS = ARGS.parse_args()
-
-    with open(ARGS.config) as fd:
-        conf = json.load(fd)
-        S3 = S3Bucket(conf['s3bucket'], conf['s3bucket_auth_key'],
-                      conf['s3bucket_auth_secret'])
-
-    main(ARGS)
+    main()
