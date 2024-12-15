@@ -1,6 +1,5 @@
 import sys
 import json
-import time
 import base64
 import sqlite3
 import logging
@@ -8,110 +7,151 @@ import argparse
 from logging import critical as log
 
 
-TYPES = dict(i='int', f='float', t='text', b='blob')
-SQL = dict(
-    add='alter table {} add column {} {}',
-    drop='alter table {} drop column {}',
-    rename='alter table {} rename column {} to {}',
-    create='create table {} ({}, primary key({}))',
-    insert='insert into {}({}) values({})',
-    update='update {} set {} where {}',
-    delete='delete from {} where {}')
+PYTYPES = dict(i=(int,), f=(int, float), t=(str,), b=(str,))
+SQLTYPES = dict(i='int', f='float', t='text', b='blob')
 
 
 def validate_types(values):
     params = dict()
 
     for k, v in values.items():
-        params[k] = v
-
         if v is not None:
-            if 'i' == k[0] and type(v) is not int:
+            if type(v) not in PYTYPES[k[0]]:
                 raise Exception('Invalid type for {}'.format(k))
-            elif 'f' == k[0] and type(v) not in (int, float):
-                raise Exception('Invalid type for {}'.format(k))
-            elif 't' == k[0] and type(v) is not str:
-                raise Exception('Invalid type for {}'.format(k))
-            elif 'b' == k[0]:
-                if type(v) is not str:
-                    raise Exception('Invalid type for {}'.format(k))
-                elif v is not None:
-                    params[k] = base64.b64decode(v)
+
+        if 'b' == k[0] and v is not None:
+            params[k] = base64.b64decode(v)
+        else:
+            params[k] = v
 
     return params
 
 
-def process_transaction(db, transaction):
-    for op in transaction:
-        if op['op'] in ('create', 'add', 'rename', 'drop'):
-            if len(transaction) != 1:
-                raise Exception('Only one DDL statement is allowed')
-
-        elif op['op'] not in ('insert', 'update', 'delete'):
-            raise Exception('Invalid Operation - {}'.format(op['op']))
-
-    conn = sqlite3.connect(db)
+def execute(conn, sql, params=dict()):
     cur = conn.cursor()
-
-    for op in transaction:
-        sql, params, table = None, dict(), op['table']
-
-        if 'create' == op['op']:
-            pk = list()
-            for k in op['primary_key']:
-                pk.append('{} {}'.format(k, TYPES[k[0]]))
-
-            pk = ', '.join(pk)
-            pk_constraint = ', '.join(op['primary_key'])
-
-            sql = SQL['create'].format(table, pk, pk_constraint)
-
-        elif 'add' == op['op']:
-            sql = SQL['add'].format(table, op['column'], TYPES[op['column'][0]])
-
-        elif 'rename' == op['op']:
-            if op['src'][0] != op['dst'][0]:
-                raise Exception('DST column type should be same as SRC')
-
-            sql = SQL['rename'].format(table, op['src'], op['dst'])
-
-        elif 'drop' == op['op']:
-            sql = SQL['drop'].format(table, op['column'])
-
-        elif 'insert' == op['op']:
-            cols = op['values'].keys()
-            params = validate_types(op['values'])
-
-            first = ','.join(cols)
-            second = ','.join([':{}'.format(c) for c in cols])
-
-            sql = SQL['insert'].format(table, first, second)
-
-        elif 'update' == op['op']:
-            set_dict = validate_types(op['values'])
-            where_dict = validate_types(op['where'])
-
-            params.update({'set_'+k: v for k, v in set_dict.items()})
-            params.update({'where_'+k: v for k, v in where_dict.items()})
-
-            first = ', '.join('{}=:set_{}'.format(k, k) for k in set_dict)
-            second = ' and '.join('{}=:where_{}'.format(k, k) for k in where_dict)
-
-            sql = SQL['update'].format(table, first, second)
-
-        elif 'delete' == op['op']:
-            params = validate_types(op['where'])
-            where = ' and '.join('{}=:{}'.format(k, k) for k in params)
-
-            sql = SQL['delete'].format(table, where)
-
-        log(sql)
+    try:
         cur.execute(sql, params)
-        log('modified(%d)', cur.rowcount)
+        log('modified(%d) %s', cur.rowcount, sql)
+    except Exception:
+        log(sql)
+        raise
 
     cur.close()
-    conn.commit()
-    conn.close()
+
+
+class Database:
+    def __init__(self, db):
+        self.conn = sqlite3.connect(db)
+
+    def __del__(self):
+        if self.conn:
+            self.conn.rollback()
+            self.conn.close()
+
+    def commit(self):
+        self.conn.commit()
+
+    def create(self, table, primary_key):
+        pk = list()
+        for k in primary_key:
+            pk.append('{} {}'.format(k, SQLTYPES[k[0]]))
+
+        pk = ', '.join(pk)
+        pk_constraint = ', '.join(primary_key)
+
+        sql = 'create table {} ({}, primary key({}))'
+        execute(self.conn, sql.format(table, pk, pk_constraint))
+
+    def add(self, table, column):
+        sql = 'alter table {} add column {} {}'
+        execute(self.conn, sql.format(table, column, SQLTYPES[column[0]]))
+
+    def rename(self, table, src_col, dst_col):
+        if src_col[0] != dst_col[0]:
+            raise Exception('DST column type should be same as SRC')
+
+        sql = 'alter table {} rename column {} to {}'
+        execute(self.conn, sql.format(table, src_col, dst_col))
+
+    def drop(self, table, column):
+        sql = 'alter table {} drop column {}'
+        execute(self.conn, sql.format(table, column))
+
+    def insert(self, table, values):
+        cols = values.keys()
+        params = validate_types(values)
+
+        first = ','.join(cols)
+        second = ','.join([':{}'.format(c) for c in cols])
+
+        sql = 'insert into {}({}) values({})'
+        execute(self.conn, sql.format(table, first, second), params)
+
+    def update(self, table, set_dict, where_dict):
+        set_dict = validate_types(set_dict)
+        where_dict = validate_types(where_dict)
+
+        params = dict()
+        params.update({'set_'+k: v for k, v in set_dict.items()})
+        params.update({'where_'+k: v for k, v in where_dict.items()})
+
+        first = ', '.join('{}=:set_{}'.format(k, k) for k in set_dict)
+        second = ' and '.join('{}=:where_{}'.format(k, k) for k in where_dict)
+
+        sql = 'update {} set {} where {}'
+        execute(self.conn, sql.format(table, first, second), params)
+
+    def delete(self, table, where):
+        params = validate_types(where)
+        where = ' and '.join('{}=:{}'.format(k, k) for k in params)
+
+        sql = 'delete from {} where {}'
+        execute(self.conn, sql.format(table, where), params)
+
+
+def process_transaction(db, transaction):
+    for op in transaction:
+        cmd, table = op['op'], op['table']
+
+        if 'insert' == cmd:
+            db.insert(table, op['values'])
+
+        if 'update' == cmd:
+            db.update(table, op['values'], op['where'])
+
+        if 'delete' == cmd:
+            db.delete(table, op['where'])
+
+
+def main(args):
+    db = Database(args.db)
+
+    if 'create' == args.operation:
+        db.create(args.table, args.primary_key.split(','))
+
+    elif 'add' == args.operation:
+        db.add(args.table, args.column)
+
+    elif 'rename' == args.operation:
+        db.rename(args.table, args.src, args.dst)
+
+    elif 'drop' == args.operation:
+        db.drop(args.table, args.column)
+
+    elif 'insert' == args.operation:
+        db.insert(args.table, json.loads(sys.stdin.read()))
+
+    elif 'update' == args.operation:
+        obj = json.loads(sys.stdin.read())
+        db.update(args.table, obj['set'], obj['where'])
+
+    elif 'delete' == args.operation:
+        db.delete(args.table, json.loads(sys.stdin.read()))
+
+    else:
+        raise Exception('Invalid Operation : {}'.format(args.operation))
+
+    db.commit()
 
 
 if __name__ == '__main__':
@@ -124,7 +164,14 @@ if __name__ == '__main__':
         help='Object bucket configuration')
 
     ARGS.add_argument('--db', help='Database Name')
+    ARGS.add_argument('--table', help='Table Name')
+    ARGS.add_argument('operation', help='Operation to be done')
+
+    ARGS.add_argument('--src', help='Old column name')
+    ARGS.add_argument('--dst', help='New column name')
+    ARGS.add_argument('--column', help='Column name')
+    ARGS.add_argument('--primary_key', help='Comma separated column list')
 
     ARGS = ARGS.parse_args()
 
-    process_transaction(ARGS.db, json.loads(sys.stdin.read()))
+    main(ARGS)
