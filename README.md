@@ -1,1 +1,1 @@
-# coredb
+# Cloud Synced SQLite
