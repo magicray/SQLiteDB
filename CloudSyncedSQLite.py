@@ -65,16 +65,19 @@ def validate_types(values):
 class Database:
     def __init__(self, db):
         self.log = json.loads(S3.get('log.json'))
-        self.conn = sqlite3.connect(db)
         self.log_buffer = list()
+
+        self.conn = sqlite3.connect(db)
         self.conn.execute('pragma journal_mode=wal')
-        self.conn.execute('''create table if not exists kv(
+        self.conn.execute('pragma synchronous=normal')
+        self.conn.execute('''create table if not exists _kv(
                                  key   text primary key,
                                  value text)''')
+        self.conn.execute("""insert or ignore into _kv(key, value)
+                             values('lsn', 0)""")
 
-        row = self.conn.execute("select value from kv where key='lsn'")
-        row = row.fetchone()
-        lsn = int(row[0]) if row else 0
+        row = self.conn.execute("select value from _kv where key='lsn'")
+        lsn = int(row.fetchone()[0])
 
         for i in range(lsn+1, self.log['total']+1):
             cur = self.conn.cursor()
@@ -84,11 +87,7 @@ class Database:
                 cur.execute(sql, params)
                 log('applied(%d) %s', i, sql)
 
-            if 1 == i:
-                self.conn.execute("insert into kv(key,value) values('lsn', 1)")
-            else:
-                self.conn.execute("update kv set value=? where key='lsn'", [i])
-
+            self.conn.execute("update _kv set value=? where key='lsn'", [i])
             self.conn.commit()
 
     def __del__(self):
@@ -102,55 +101,51 @@ class Database:
         S3.put('logs/' + str(self.log['total']), pickle.dumps(self.log_buffer))
         S3.put('log.json', json.dumps(self.log), 'application/json')
 
-        if 1 == self.log['total']:
-            self.conn.execute("insert into kv(key, value) values('lsn', 1)")
-        else:
-            self.conn.execute("update kv set value=? where key='lsn'",
-                              [self.log['total']])
+        self.conn.execute("update _kv set value=? where key='lsn'",
+                          [self.log['total']])
         self.conn.commit()
 
         self.log_buffer = list()
 
     def execute(self, sql, params=dict()):
-        cur = self.conn.cursor()
         try:
+            cur = self.conn.cursor()
             self.log_buffer.append((sql, params))
             cur.execute(sql, params)
             log('modified(%d) %s', cur.rowcount, sql)
+            cur.close()
         except Exception as e:
+            self.log_buffer = None
             self.conn.rollback()
             self.conn.close()
-            self.log_buffer = list()
+            self.conn = None
             log('exception(%s) %s', e, sql)
             raise
-
-        cur.close()
 
     def create(self, table, primary_key):
         pk = list()
         for k in primary_key:
-            pk.append('{} {}'.format(k, SQLTYPES[k[0]]))
+            pk.append('{} {} not null'.format(k, SQLTYPES[k[0]]))
 
         pk = ', '.join(pk)
         pk_constraint = ', '.join(primary_key)
 
-        sql = 'create table {} ({}, primary key({}))'
-        self.execute(sql.format(table, pk, pk_constraint))
+        self.execute('create table {} ({}, primary key({}))'.format(
+            table, pk, pk_constraint))
 
     def add(self, table, column):
-        sql = 'alter table {} add column {} {}'
-        self.execute(sql.format(table, column, SQLTYPES[column[0]]))
+        self.execute('alter table {} add column {} {}'.format(
+            table, column, SQLTYPES[column[0]]))
 
     def rename(self, table, src_col, dst_col):
         if src_col[0] != dst_col[0]:
             raise Exception('DST column type should be same as SRC')
 
-        sql = 'alter table {} rename column {} to {}'
-        self.execute(sql.format(table, src_col, dst_col))
+        self.execute('alter table {} rename column {} to {}'.format(
+            table, src_col, dst_col))
 
     def drop(self, table, column):
-        sql = 'alter table {} drop column {}'
-        self.execute(sql.format(table, column))
+        self.execute('alter table {} drop column {}'.format(table, column))
 
     def insert(self, table, values):
         cols = values.keys()
@@ -159,8 +154,8 @@ class Database:
         first = ','.join(cols)
         second = ','.join([':{}'.format(c) for c in cols])
 
-        sql = 'insert into {}({}) values({})'
-        self.execute(sql.format(table, first, second), params)
+        self.execute('insert into {}({}) values({})'.format(
+            table, first, second), params)
 
     def update(self, table, set_dict, where_dict):
         set_dict = validate_types(set_dict)
@@ -173,15 +168,14 @@ class Database:
         first = ', '.join('{}=:set_{}'.format(k, k) for k in set_dict)
         second = ' and '.join('{}=:where_{}'.format(k, k) for k in where_dict)
 
-        sql = 'update {} set {} where {}'
-        self.execute(sql.format(table, first, second), params)
+        self.execute('update {} set {} where {}'.format(
+            table, first, second), params)
 
     def delete(self, table, where):
         params = validate_types(where)
         where = ' and '.join('{}=:{}'.format(k, k) for k in params)
 
-        sql = 'delete from {} where {}'
-        self.execute(sql.format(table, where), params)
+        self.execute('delete from {} where {}'.format(table, where), params)
 
 
 def main(args):
