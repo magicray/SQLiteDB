@@ -91,6 +91,8 @@ class Database:
             self.conn.execute("update _kv set value=? where key='lsn'", [i])
             self.conn.commit()
 
+        log('initialized(%s.sqlite3) s3bucket(%s)', db, s3bucket)
+
     def __del__(self):
         if self.conn:
             self.conn.rollback()
@@ -119,7 +121,7 @@ class Database:
         self.txns.append((sql, params))
         log('modified(%d) %s', count, sql)
 
-    def create(self, table, primary_key):
+    def create_table(self, table, primary_key):
         pk = list()
         for k in primary_key:
             pk.append('{} {} not null'.format(k, SQLTYPES[k[0]]))
@@ -130,18 +132,21 @@ class Database:
         self.execute('create table {} ({}, primary key({}))'.format(
             table, pk, pk_constraint))
 
-    def add(self, table, column):
+    def drop_table(self, table):
+        self.execute('drop table {}'.format(table))
+
+    def add_column(self, table, column):
         self.execute('alter table {} add column {} {}'.format(
             table, column, SQLTYPES[column[0]]))
 
-    def rename(self, table, src_col, dst_col):
+    def rename_column(self, table, src_col, dst_col):
         if src_col[0] != dst_col[0]:
             raise Exception('DST column type should be same as SRC')
 
         self.execute('alter table {} rename column {} to {}'.format(
             table, src_col, dst_col))
 
-    def drop(self, table, column):
+    def drop_column(self, table, column):
         self.execute('alter table {} drop column {}'.format(table, column))
 
     def insert(self, table, values):
@@ -201,17 +206,20 @@ def main():
     db = Database(args.db, conf['s3bucket'], conf['s3bucket_auth_key'],
                   conf['s3bucket_auth_secret'])
 
-    if 'create' == args.operation:
-        db.create(args.table, args.primary_key.split(','))
+    if 'create_table' == args.operation:
+        db.create_table(args.table, args.primary_key.split(','))
 
-    elif 'add' == args.operation:
-        db.add(args.table, args.column)
+    elif 'drop_table' == args.operation:
+        db.drop_table(args.table)
 
-    elif 'rename' == args.operation:
-        db.rename(args.table, args.src, args.dst)
+    elif 'add_column' == args.operation:
+        db.add_column(args.table, args.column)
 
-    elif 'drop' == args.operation:
-        db.drop(args.table, args.column)
+    elif 'rename_column' == args.operation:
+        db.rename_column(args.table, args.src, args.dst)
+
+    elif 'drop_column' == args.operation:
+        db.drop_column(args.table, args.column)
 
     elif 'insert' == args.operation:
         db.insert(args.table, json.loads(sys.stdin.read()))
