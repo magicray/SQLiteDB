@@ -11,18 +11,19 @@ from logging import critical as log
 
 
 class S3Bucket:
-    def __init__(self, s3bucket, key_id, secret_key):
+    def __init__(self, db, s3bucket, key_id, secret_key):
         tmp = s3bucket.split('/')
         self.bucket = tmp[-1]
         self.endpoint = '/'.join(tmp[:-1])
 
+        self.db = db
         self.s3 = boto3.client('s3', endpoint_url=self.endpoint,
                                aws_access_key_id=key_id,
                                aws_secret_access_key=secret_key)
 
     def get(self, key):
         ts = time.time()
-        key = 'Cloud Synced SQLite/' + key
+        key = 'SQLiteDB/{}/{}'.format(self.db, key)
         obj = self.s3.get_object(Bucket=self.bucket, Key=key)
         octets = obj['Body'].read()
         assert (len(octets) == obj['ContentLength'])
@@ -33,7 +34,7 @@ class S3Bucket:
 
     def put(self, key, value, content_type='application/octet-stream'):
         ts = time.time()
-        key = 'Cloud Synced SQLite/' + key
+        key = 'SQLiteDB/{}/{}'.format(self.db, key)
         self.s3.put_object(Bucket=self.bucket, Key=key, Body=value,
                            ContentType=content_type)
         log('s3(%s) put(%s/%s) length(%d) msec(%d)',
@@ -62,12 +63,12 @@ def validate_types(values):
 
 
 class Database:
-    def __init__(self, db, s3):
-        self.s3 = s3
+    def __init__(self, db, s3bucket, s3_auth_key, s3_auth_secret):
+        self.s3 = S3Bucket(db, s3bucket, s3_auth_key, s3_auth_secret)
         self.log = json.loads(self.s3.get('log.json'))
         self.txns = list()
 
-        self.conn = sqlite3.connect(db)
+        self.conn = sqlite3.connect(db + '.sqlite3')
         self.conn.execute('pragma journal_mode=wal')
         self.conn.execute('pragma synchronous=normal')
         self.conn.execute('''create table if not exists _kv(
@@ -81,7 +82,7 @@ class Database:
 
         for i in range(lsn+1, self.log['total']+1):
             cur = self.conn.cursor()
-            txn = pickle.loads(self.s3.get('logs/' + str(i)))
+            txn = pickle.loads(self.s3.get('logs/{}'.format(i)))
 
             for sql, params in txn:
                 cur.execute(sql, params)
@@ -96,31 +97,27 @@ class Database:
             self.conn.close()
 
     def commit(self):
-        self.log['total'] += 1
+        log, self.log = self.log, None
+        txns, self.txns = self.txns, None
 
-        self.s3.put('logs/' + str(self.log['total']), pickle.dumps(self.txns))
-        self.s3.put('log.json', json.dumps(self.log), 'application/json')
+        log['total'] += 1
+        self.s3.put('logs/' + str(log['total']), pickle.dumps(txns))
+        self.s3.put('log.json', json.dumps(log))
 
         self.conn.execute("update _kv set value=? where key='lsn'",
-                          [self.log['total']])
+                          [log['total']])
         self.conn.commit()
 
-        self.txns = list()
+        self.log, self.txns = log, list()
 
     def execute(self, sql, params=dict()):
-        try:
-            cur = self.conn.cursor()
-            self.txns.append((sql, params))
-            cur.execute(sql, params)
-            log('modified(%d) %s', cur.rowcount, sql)
-            cur.close()
-        except Exception as e:
-            self.txns = None
-            self.conn.rollback()
-            self.conn.close()
-            self.conn = None
-            log('exception(%s) %s', e, sql)
-            raise
+        cur = self.conn.cursor()
+        cur.execute(sql, params)
+        count = cur.rowcount
+        cur.close()
+
+        self.txns.append((sql, params))
+        log('modified(%d) %s', count, sql)
 
     def create(self, table, primary_key):
         pk = list()
@@ -200,10 +197,9 @@ def main():
 
     with open(args.config) as fd:
         conf = json.load(fd)
-        s3 = S3Bucket(conf['s3bucket'], conf['s3bucket_auth_key'],
-                      conf['s3bucket_auth_secret'])
 
-    db = Database(args.db, s3)
+    db = Database(args.db, conf['s3bucket'], conf['s3bucket_auth_key'],
+                  conf['s3bucket_auth_secret'])
 
     if 'create' == args.operation:
         db.create(args.table, args.primary_key.split(','))
