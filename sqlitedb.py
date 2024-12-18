@@ -64,8 +64,8 @@ def validate_types(values):
 
 class Database:
     def __init__(self, db, s3bucket, s3_auth_key, s3_auth_secret):
+        self.db = db
         self.s3 = S3Bucket(db, s3bucket, s3_auth_key, s3_auth_secret)
-        self.log = json.loads(self.s3.get('log.json'))
         self.txns = list()
 
         self.conn = sqlite3.connect(db + '.sqlite3')
@@ -77,21 +77,9 @@ class Database:
         self.conn.execute("""insert or ignore into _kv(key, value)
                              values('lsn', 0)""")
 
-        row = self.conn.execute("select value from _kv where key='lsn'")
-        lsn = int(row.fetchone()[0])
-
-        for i in range(lsn+1, self.log['total']+1):
-            cur = self.conn.cursor()
-            txn = pickle.loads(self.s3.get('logs/{}'.format(i)))
-
-            for sql, params in txn:
-                cur.execute(sql, params)
-                log('applied(%d) %s', i, sql)
-
-            self.conn.execute("update _kv set value=? where key='lsn'", [i])
-            self.conn.commit()
-
-        log('initialized(%s.sqlite3) s3bucket(%s)', db, s3bucket)
+        self.log = json.loads(self.s3.get('log.json'))
+        lsn = self.sync()
+        assert (self.log['total'] == lsn)
 
     def __del__(self):
         if self.conn:
@@ -121,16 +109,32 @@ class Database:
         self.txns.append((sql, params))
         log('modified(%d) %s', count, sql)
 
-    def create_table(self, table, primary_key):
-        pk = list()
-        for k in primary_key:
-            pk.append('{} {} not null'.format(k, SQLTYPES[k[0]]))
+    def sync(self):
+        row = self.conn.execute("select value from _kv where key='lsn'")
+        lsn = int(row.fetchone()[0])
 
-        pk = ', '.join(pk)
-        pk_constraint = ', '.join(primary_key)
+        total = json.loads(self.s3.get('log.json'))['total']
+
+        for i in range(lsn+1, total+1):
+            cur = self.conn.cursor()
+            txn = pickle.loads(self.s3.get('logs/{}'.format(i)))
+
+            for sql, params in txn:
+                cur.execute(sql, params)
+                log('applied(%d) %s', i, sql)
+
+            self.conn.execute("update _kv set value=? where key='lsn'", [i])
+            self.conn.commit()
+
+        log('initialized(%s.sqlite3) lsn(%d)', self.db, total)
+
+        return total
+
+    def create_table(self, table, primary_key):
+        col = ['{} {} not null'.format(k, SQLTYPES[k[0]]) for k in primary_key]
 
         self.execute('create table {} ({}, primary key({}))'.format(
-            table, pk, pk_constraint))
+            table, ', '.join(col), ', '.join(primary_key)))
 
     def drop_table(self, table):
         self.execute('drop table {}'.format(table))
@@ -149,15 +153,12 @@ class Database:
     def drop_column(self, table, column):
         self.execute('alter table {} drop column {}'.format(table, column))
 
-    def insert(self, table, values):
-        cols = values.keys()
-        params = validate_types(values)
-
-        first = ','.join(cols)
-        second = ','.join([':{}'.format(c) for c in cols])
+    def insert(self, table, row):
+        params = validate_types(row)
+        placeholders = [':{}'.format(k) for k in row]
 
         self.execute('insert into {}({}) values({})'.format(
-            table, first, second), params)
+            table, ', '.join(row), ', '.join(placeholders)), params)
 
     def update(self, table, set_dict, where_dict):
         set_dict = validate_types(set_dict)
@@ -191,7 +192,10 @@ def main():
 
     args.add_argument('--db', help='Database Name')
     args.add_argument('--table', help='Table Name')
-    args.add_argument('operation', help='Operation to be done')
+    args.add_argument('operation', help='Operation to be done',
+                      choices=['create_table', 'drop_table', 'add_column',
+                               'rename_column', 'drop_column',
+                               'insert', 'update', 'delete', 'sync'])
 
     args.add_argument('--src', help='Old column name')
     args.add_argument('--dst', help='New column name')
@@ -231,6 +235,15 @@ def main():
     elif 'delete' == args.operation:
         db.delete(args.table, json.loads(sys.stdin.read()))
 
+    elif 'sync' == args.operation:
+        old = 0
+        delay = 1
+        while True:
+            lsn = db.sync()
+            if old == lsn:
+                time.sleep(delay)
+                delay = min(60, 2*delay)
+            old = lsn
     else:
         raise Exception('Invalid Operation : {}'.format(args.operation))
 
