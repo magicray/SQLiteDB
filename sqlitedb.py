@@ -24,7 +24,12 @@ class S3Bucket:
     def get(self, key):
         ts = time.time()
         key = 'SQLiteDB/{}/{}'.format(self.db, key)
-        obj = self.s3.get_object(Bucket=self.bucket, Key=key)
+
+        try:
+            obj = self.s3.get_object(Bucket=self.bucket, Key=key)
+        except self.s3.exceptions.NoSuchKey:
+            return None
+
         octets = obj['Body'].read()
         assert (len(octets) == obj['ContentLength'])
         log('s3(%s) get(%s/%s) length(%d) msec(%d)',
@@ -36,36 +41,16 @@ class S3Bucket:
         ts = time.time()
         key = 'SQLiteDB/{}/{}'.format(self.db, key)
         self.s3.put_object(Bucket=self.bucket, Key=key, Body=value,
-                           ContentType=content_type)
+                           ContentType=content_type, IfNoneMatch='*')
         log('s3(%s) put(%s/%s) length(%d) msec(%d)',
             self.endpoint, self.bucket, key, len(value),
             (time.time()-ts) * 1000)
 
 
-PYTYPES = dict(i=(int,), f=(int, float), t=(str,), b=(str, bytes))
-SQLTYPES = dict(i='int', f='float', t='text', b='blob')
-
-
-def validate_types(values):
-    params = dict()
-
-    for k, v in values.items():
-        if v is not None:
-            if type(v) not in PYTYPES[k[0]]:
-                raise Exception('Invalid type for {}'.format(k))
-
-        if 'b' == k[0] and type(v) is str:
-            params[k] = base64.b64decode(v)
-        else:
-            params[k] = v
-
-    return params
-
-
-class Database:
+class CoreDB:
     def __init__(self, db, s3bucket, s3_auth_key, s3_auth_secret):
         self.db = db
-        self.s3 = S3Bucket(db, s3bucket, s3_auth_key, s3_auth_secret)
+        self.lsn = None
         self.txns = list()
 
         self.conn = sqlite3.connect(db + '.sqlite3')
@@ -77,9 +62,8 @@ class Database:
         self.conn.execute("""insert or ignore into _kv(key, value)
                              values('lsn', 0)""")
 
-        self.log = json.loads(self.s3.get('log.json'))
-        lsn = self.sync()
-        assert (self.log['total'] == lsn)
+        self.s3 = S3Bucket(db, s3bucket, s3_auth_key, s3_auth_secret)
+        self.sync()
 
     def __del__(self):
         if self.conn:
@@ -87,20 +71,16 @@ class Database:
             self.conn.close()
 
     def commit(self):
-        log, self.log = self.log, None
         txns, self.txns = self.txns, None
 
-        log['total'] += 1
-        self.s3.put('logs/' + str(log['total']), pickle.dumps(txns))
-        self.s3.put('log.json', json.dumps(log))
-
-        self.conn.execute("update _kv set value=? where key='lsn'",
-                          [log['total']])
+        self.lsn += 1
+        self.s3.put('logs/' + str(self.lsn), pickle.dumps(txns))
+        self.conn.execute("update _kv set value=? where key='lsn'", [self.lsn])
         self.conn.commit()
 
-        self.log, self.txns = log, list()
+        self.txns = list()
 
-    def execute(self, sql, params=dict()):
+    def modify(self, sql, params=dict()):
         cur = self.conn.cursor()
         cur.execute(sql, params)
         count = cur.rowcount
@@ -109,60 +89,99 @@ class Database:
         self.txns.append((sql, params))
         log('modified(%d) %s', count, sql)
 
+    def read(self, sql, params=dict()):
+        cur = self.conn.cursor()
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        cur.close()
+
+        log('fetched(%d) %s', len(rows), sql)
+        return rows
+
     def sync(self):
-        row = self.conn.execute("select value from _kv where key='lsn'")
-        lsn = int(row.fetchone()[0])
+        rows = self.read("select value from _kv where key='lsn'")
+        self.lsn = int(rows[0][0])
 
-        total = json.loads(self.s3.get('log.json'))['total']
-
-        for i in range(lsn+1, total+1):
+        while True:
             cur = self.conn.cursor()
-            txn = pickle.loads(self.s3.get('logs/{}'.format(i)))
+
+            octets = self.s3.get('logs/{}'.format(self.lsn+1))
+            if octets is None:
+                break
+
+            txn = pickle.loads(octets)
 
             for sql, params in txn:
                 cur.execute(sql, params)
-                log('applied(%d) %s', i, sql)
+                log('applied(%d) %s', self.lsn+1, sql)
 
-            self.conn.execute("update _kv set value=? where key='lsn'", [i])
+            self.conn.execute("update _kv set value=? where key='lsn'",
+                              [self.lsn+1])
             self.conn.commit()
+            self.lsn += 1
 
-        log('initialized(%s.sqlite3) lsn(%d)', self.db, total)
+        log('initialized(%s.sqlite3) lsn(%d)', self.db, self.lsn)
 
-        return total
+
+class Database:
+    def __init__(self, db, s3bucket, s3_auth_key, s3_auth_secret):
+        self.db = CoreDB(db, s3bucket, s3_auth_key, s3_auth_secret)
+
+        self.SQLTYPES = dict(i='int', f='float', t='text', b='blob')
+        self.PYTYPES = dict(i=(int,), f=(int, float), t=(str,), b=(str, bytes))
+
+    def commit(self):
+        self.db.commit()
+
+    def validate_types(self, values):
+        params = dict()
+
+        for k, v in values.items():
+            if v is not None:
+                if type(v) not in self.PYTYPES[k[0]]:
+                    raise Exception('Invalid type for {}'.format(k))
+
+            if 'b' == k[0] and type(v) is str:
+                params[k] = base64.b64decode(v)
+            else:
+                params[k] = v
+
+        return params
 
     def create_table(self, table, primary_key):
-        col = ['{} {} not null'.format(k, SQLTYPES[k[0]]) for k in primary_key]
+        col = ['{} {} not null'.format(k, self.SQLTYPES[k[0]])
+               for k in primary_key]
 
-        self.execute('create table {} ({}, primary key({}))'.format(
+        self.db.modify('create table {} ({}, primary key({}))'.format(
             table, ', '.join(col), ', '.join(primary_key)))
 
     def drop_table(self, table):
-        self.execute('drop table {}'.format(table))
+        self.db.modify('drop table {}'.format(table))
 
     def add_column(self, table, column):
-        self.execute('alter table {} add column {} {}'.format(
-            table, column, SQLTYPES[column[0]]))
+        self.db.modify('alter table {} add column {} {}'.format(
+            table, column, self.SQLTYPES[column[0]]))
 
     def rename_column(self, table, src_col, dst_col):
         if src_col[0] != dst_col[0]:
             raise Exception('DST column type should be same as SRC')
 
-        self.execute('alter table {} rename column {} to {}'.format(
+        self.db.modify('alter table {} rename column {} to {}'.format(
             table, src_col, dst_col))
 
     def drop_column(self, table, column):
-        self.execute('alter table {} drop column {}'.format(table, column))
+        self.db.modify('alter table {} drop column {}'.format(table, column))
 
     def insert(self, table, row):
-        params = validate_types(row)
+        params = self.validate_types(row)
         placeholders = [':{}'.format(k) for k in row]
 
-        self.execute('insert into {}({}) values({})'.format(
+        self.db.modify('insert into {}({}) values({})'.format(
             table, ', '.join(row), ', '.join(placeholders)), params)
 
     def update(self, table, set_dict, where_dict):
-        set_dict = validate_types(set_dict)
-        where_dict = validate_types(where_dict)
+        set_dict = self.validate_types(set_dict)
+        where_dict = self.validate_types(where_dict)
 
         params = dict()
         params.update({'set_'+k: v for k, v in set_dict.items()})
@@ -171,14 +190,14 @@ class Database:
         first = ', '.join('{}=:set_{}'.format(k, k) for k in set_dict)
         second = ' and '.join('{}=:where_{}'.format(k, k) for k in where_dict)
 
-        self.execute('update {} set {} where {}'.format(
+        self.db.modify('update {} set {} where {}'.format(
             table, first, second), params)
 
     def delete(self, table, where):
-        params = validate_types(where)
+        params = self.validate_types(where)
         where = ' and '.join('{}=:{}'.format(k, k) for k in params)
 
-        self.execute('delete from {} where {}'.format(table, where), params)
+        self.db.modify('delete from {} where {}'.format(table, where), params)
 
 
 def main():
