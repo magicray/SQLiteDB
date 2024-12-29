@@ -3,11 +3,40 @@ import json
 import time
 import boto3
 import base64
-import pickle
 import sqlite3
 import logging
 import argparse
 from logging import critical as log
+
+
+def dump(txn):
+    tmp_list = list()
+
+    for sql, params in txn:
+        tmp_dict = dict()
+
+        for k, v in params.items():
+            tmp_dict[k] = base64.b64encode(v).decode() if 'b' == k[0] else v
+
+        tmp_list.append((sql, tmp_dict))
+
+    return json.dumps(tmp_list, indent=4, sort_keys=True)
+
+
+def load(octets):
+    txn = json.loads(octets.decode())
+
+    tmp_list = list()
+
+    for sql, params in txn:
+        tmp_dict = dict()
+
+        for k, v in params.items():
+            tmp_dict[k] = base64.b64decode(v).encode() if 'b' == k[0] else v
+
+        tmp_list.append((sql, tmp_dict))
+
+    return tmp_list
 
 
 class S3Bucket:
@@ -74,7 +103,7 @@ class CoreDB:
         txns, self.txns = self.txns, None
 
         self.lsn += 1
-        self.s3.put('logs/' + str(self.lsn), pickle.dumps(txns))
+        self.s3.put('logs/' + str(self.lsn), dump(txns))
         self.conn.execute("update _kv set value=? where key='lsn'", [self.lsn])
         self.conn.commit()
 
@@ -109,9 +138,7 @@ class CoreDB:
             if octets is None:
                 break
 
-            txn = pickle.loads(octets)
-
-            for sql, params in txn:
+            for sql, params in load(octets):
                 cur.execute(sql, params)
                 log('applied(%d) %s', self.lsn+1, sql)
 
@@ -128,17 +155,17 @@ class Database:
         self.db = CoreDB(db, s3bucket, s3_auth_key, s3_auth_secret)
 
         self.SQLTYPES = dict(i='int', f='float', t='text', b='blob')
-        self.PYTYPES = dict(i=(int,), f=(int, float), t=(str,), b=(str, bytes))
 
     def commit(self):
         self.db.commit()
 
     def validate_types(self, values):
-        params = dict()
+        PYTYPES = dict(i=(int,), f=(int, float), t=(str,), b=(str, bytes))
 
+        params = dict()
         for k, v in values.items():
             if v is not None:
-                if type(v) not in self.PYTYPES[k[0]]:
+                if type(v) not in PYTYPES[k[0]]:
                     raise Exception('Invalid type for {}'.format(k))
 
             if 'b' == k[0] and type(v) is str:
@@ -184,11 +211,11 @@ class Database:
         where_dict = self.validate_types(where_dict)
 
         params = dict()
-        params.update({'set_'+k: v for k, v in set_dict.items()})
-        params.update({'where_'+k: v for k, v in where_dict.items()})
+        params.update({k+'_set': v for k, v in set_dict.items()})
+        params.update({k+'_where': v for k, v in where_dict.items()})
 
-        first = ', '.join('{}=:set_{}'.format(k, k) for k in set_dict)
-        second = ' and '.join('{}=:where_{}'.format(k, k) for k in where_dict)
+        first = ', '.join('{}=:{}_set'.format(k, k) for k in set_dict)
+        second = ' and '.join('{}=:{}_where'.format(k, k) for k in where_dict)
 
         self.db.modify('update {} set {} where {}'.format(
             table, first, second), params)
