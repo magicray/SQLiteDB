@@ -32,7 +32,7 @@ def load(octets):
         tmp_dict = dict()
 
         for k, v in params.items():
-            tmp_dict[k] = base64.b64decode(v).encode() if 'b' == k[0] else v
+            tmp_dict[k] = base64.b64decode(v.encode()) if 'b' == k[0] else v
 
         tmp_list.append((sql, tmp_dict))
 
