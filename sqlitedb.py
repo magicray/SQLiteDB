@@ -9,50 +9,18 @@ import argparse
 from logging import critical as log
 
 
-def dump(txn):
-    tmp_list = list()
-
-    for sql, params in txn:
-        tmp_dict = dict()
-
-        for k, v in params.items():
-            tmp_dict[k] = base64.b64encode(v).decode() if 'b' == k[0] else v
-
-        tmp_list.append((sql, tmp_dict))
-
-    return json.dumps(tmp_list, indent=4, sort_keys=True)
-
-
-def load(octets):
-    txn = json.loads(octets.decode())
-
-    tmp_list = list()
-
-    for sql, params in txn:
-        tmp_dict = dict()
-
-        for k, v in params.items():
-            tmp_dict[k] = base64.b64decode(v.encode()) if 'b' == k[0] else v
-
-        tmp_list.append((sql, tmp_dict))
-
-    return tmp_list
-
-
 class S3Bucket:
-    def __init__(self, db, s3bucket, key_id, secret_key):
+    def __init__(self, s3bucket, key_id, secret_key):
         tmp = s3bucket.split('/')
         self.bucket = tmp[-1]
         self.endpoint = '/'.join(tmp[:-1])
 
-        self.db = db
         self.s3 = boto3.client('s3', endpoint_url=self.endpoint,
                                aws_access_key_id=key_id,
                                aws_secret_access_key=secret_key)
 
     def get(self, key):
         ts = time.time()
-        key = 'SQLiteDB/{}/{}'.format(self.db, key)
 
         try:
             obj = self.s3.get_object(Bucket=self.bucket, Key=key)
@@ -66,11 +34,10 @@ class S3Bucket:
             (time.time()-ts) * 1000)
         return octets
 
-    def put(self, key, value, content_type='application/octet-stream'):
+    def put(self, key, value):
         ts = time.time()
-        key = 'SQLiteDB/{}/{}'.format(self.db, key)
         self.s3.put_object(Bucket=self.bucket, Key=key, Body=value,
-                           ContentType=content_type, IfNoneMatch='*')
+                           IfNoneMatch='*')
         log('s3(%s) put(%s/%s) length(%d) msec(%d)',
             self.endpoint, self.bucket, key, len(value),
             (time.time()-ts) * 1000)
@@ -83,15 +50,15 @@ class CoreDB:
         self.txns = list()
 
         self.conn = sqlite3.connect(db + '.sqlite3')
-        self.conn.execute('pragma journal_mode=wal')
-        self.conn.execute('pragma synchronous=normal')
+        self.conn.execute('PRAGMA journal_mode=WAL')
+        self.conn.execute('PRAGMA synchronous=NORMAL')
         self.conn.execute('''create table if not exists _kv(
                                  key   text primary key,
                                  value text)''')
         self.conn.execute("""insert or ignore into _kv(key, value)
                              values('lsn', 0)""")
 
-        self.s3 = S3Bucket(db, s3bucket, s3_auth_key, s3_auth_secret)
+        self.s3 = S3Bucket(s3bucket, s3_auth_key, s3_auth_secret)
         self.sync()
 
     def __del__(self):
@@ -100,14 +67,24 @@ class CoreDB:
             self.conn.close()
 
     def commit(self):
+        lsn, self.lsn = self.lsn, None
         txns, self.txns = self.txns, None
 
-        self.lsn += 1
-        self.s3.put('logs/' + str(self.lsn), dump(txns))
-        self.conn.execute("update _kv set value=? where key='lsn'", [self.lsn])
+        TYPES = dict(i=int, f=float, t=str, b=bytes)
+        for sql, params in txns:
+            for k, v in params.items():
+                assert (type(v) is TYPES[k[0]])
+
+                if 'b' == k[0]:
+                    params[k] = base64.b64encode(v).decode()
+
+        octets = json.dumps(txns, indent=4, sort_keys=True)
+
+        self.s3.put('SQLiteDB/{}/logs/{}'.format(self.db, lsn+1), octets)
+        self.conn.execute("update _kv set value=? where key='lsn'", [lsn+1])
         self.conn.commit()
 
-        self.txns = list()
+        self.lsn, self.txns = lsn+1, list()
 
     def modify(self, sql, params=dict()):
         cur = self.conn.cursor()
@@ -118,27 +95,29 @@ class CoreDB:
         self.txns.append((sql, params))
         log('modified(%d) %s', count, sql)
 
-    def read(self, sql, params=dict()):
-        cur = self.conn.cursor()
-        cur.execute(sql, params)
-        rows = cur.fetchall()
-        cur.close()
-
-        log('fetched(%d) %s', len(rows), sql)
-        return rows
-
     def sync(self):
         rows = self.read("select value from _kv where key='lsn'")
         self.lsn = int(rows[0][0])
 
         while True:
-            cur = self.conn.cursor()
-
-            octets = self.s3.get('logs/{}'.format(self.lsn+1))
+            octets = self.s3.get('SQLiteDB/{}/logs/{}'.format(
+                                 self.db, self.lsn+1))
             if octets is None:
                 break
 
-            for sql, params in load(octets):
+            txns = json.loads(octets)
+
+            TYPES = dict(i=int, f=float, t=str, b=bytes)
+            for sql, params in txns:
+                for k, v in params.items():
+                    if 'b' == k[0]:
+                        params[k] = base64.b64decode(v.encode())
+
+                    assert (type(params[k]) is TYPES[k[0]])
+
+            cur = self.conn.cursor()
+
+            for sql, params in txns:
                 cur.execute(sql, params)
                 log('applied(%d) %s', self.lsn+1, sql)
 
@@ -148,6 +127,15 @@ class CoreDB:
             self.lsn += 1
 
         log('initialized(%s.sqlite3) lsn(%d)', self.db, self.lsn)
+
+    def read(self, sql, params=dict()):
+        cur = self.conn.cursor()
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        cur.close()
+
+        log('fetched(%d) %s', len(rows), sql)
+        return rows
 
 
 class Database:
