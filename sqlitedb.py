@@ -1,3 +1,4 @@
+import os
 import sys
 import json
 import time
@@ -10,14 +11,13 @@ from logging import critical as log
 
 
 class S3Bucket:
-    def __init__(self, s3bucket, key_id, secret_key):
-        tmp = s3bucket.split('/')
-        self.bucket = tmp[-1]
-        self.endpoint = '/'.join(tmp[:-1])
+    def __init__(self, endpoint, bucket, auth_key, auth_secret):
+        self.bucket = bucket
+        self.endpoint = endpoint
 
         self.s3 = boto3.client('s3', endpoint_url=self.endpoint,
-                               aws_access_key_id=key_id,
-                               aws_secret_access_key=secret_key)
+                               aws_access_key_id=auth_key,
+                               aws_secret_access_key=auth_secret)
 
     def get(self, key):
         ts = time.time()
@@ -29,7 +29,7 @@ class S3Bucket:
 
         octets = obj['Body'].read()
         assert (len(octets) == obj['ContentLength'])
-        log('s3(%s) get(%s/%s) length(%d) msec(%d)',
+        log('s3(%s) bucket(%s) get(%s) length(%d) msec(%d)',
             self.endpoint, self.bucket, key, len(octets),
             (time.time()-ts) * 1000)
         return octets
@@ -38,13 +38,13 @@ class S3Bucket:
         ts = time.time()
         self.s3.put_object(Bucket=self.bucket, Key=key, Body=value,
                            IfNoneMatch='*')
-        log('s3(%s) put(%s/%s) length(%d) msec(%d)',
+        log('s3(%s) bucket(%s) put(%s) length(%d) msec(%d)',
             self.endpoint, self.bucket, key, len(value),
             (time.time()-ts) * 1000)
 
 
 class CoreDB:
-    def __init__(self, db, s3bucket, s3_auth_key, s3_auth_secret):
+    def __init__(self, db, endpoint, bucket, auth_key, auth_secret):
         self.db = db
         self.lsn = None
         self.txns = list()
@@ -58,7 +58,7 @@ class CoreDB:
         self.conn.execute("""insert or ignore into _kv(key, value)
                              values('lsn', 0)""")
 
-        self.s3 = S3Bucket(s3bucket, s3_auth_key, s3_auth_secret)
+        self.s3 = S3Bucket(endpoint, bucket, auth_key, auth_secret)
         self.sync()
 
     def __del__(self):
@@ -86,18 +86,25 @@ class CoreDB:
 
         self.lsn, self.txns = lsn+1, list()
 
-    def modify(self, sql, params=dict()):
+    def execute(self, sql, params=dict()):
         cur = self.conn.cursor()
         cur.execute(sql, params)
         count = cur.rowcount
+        rows = cur.fetchall()
         cur.close()
 
-        self.txns.append((sql, params))
-        log('modified(%d) %s', count, sql)
+        if rows:
+            log('fetched(%d) sql(%s)', len(rows), sql)
+            return rows
+        elif count == 0:
+            log('unchanged(%d) sql(%s)', count, sql)
+        else:
+            self.txns.append((sql, params))
+            log('modified(%d) sql(%s)', count, sql)
 
     def sync(self):
-        rows = self.read("select value from _kv where key='lsn'")
-        self.lsn = int(rows[0][0])
+        cur = self.conn.execute("select value from _kv where key='lsn'")
+        self.lsn = int(cur.fetchall()[0][0])
 
         while True:
             octets = self.s3.get('SQLiteDB/{}/logs/{}'.format(
@@ -128,19 +135,10 @@ class CoreDB:
 
         log('initialized(%s.sqlite3) lsn(%d)', self.db, self.lsn)
 
-    def read(self, sql, params=dict()):
-        cur = self.conn.cursor()
-        cur.execute(sql, params)
-        rows = cur.fetchall()
-        cur.close()
-
-        log('fetched(%d) %s', len(rows), sql)
-        return rows
-
 
 class Database:
-    def __init__(self, db, s3bucket, s3_auth_key, s3_auth_secret):
-        self.db = CoreDB(db, s3bucket, s3_auth_key, s3_auth_secret)
+    def __init__(self, db, endpoint, bucket, auth_key, auth_secret):
+        self.db = CoreDB(db, endpoint, bucket, auth_key, auth_secret)
 
         self.SQLTYPES = dict(i='int', f='float', t='text', b='blob')
 
@@ -167,31 +165,31 @@ class Database:
         col = ['{} {} not null'.format(k, self.SQLTYPES[k[0]])
                for k in primary_key]
 
-        self.db.modify('create table {} ({}, primary key({}))'.format(
+        self.db.execute('create table {} ({}, primary key({}))'.format(
             table, ', '.join(col), ', '.join(primary_key)))
 
     def drop_table(self, table):
-        self.db.modify('drop table {}'.format(table))
+        self.db.execute('drop table {}'.format(table))
 
     def add_column(self, table, column):
-        self.db.modify('alter table {} add column {} {}'.format(
+        self.db.execute('alter table {} add column {} {}'.format(
             table, column, self.SQLTYPES[column[0]]))
 
     def rename_column(self, table, src_col, dst_col):
         if src_col[0] != dst_col[0]:
             raise Exception('DST column type should be same as SRC')
 
-        self.db.modify('alter table {} rename column {} to {}'.format(
+        self.db.execute('alter table {} rename column {} to {}'.format(
             table, src_col, dst_col))
 
     def drop_column(self, table, column):
-        self.db.modify('alter table {} drop column {}'.format(table, column))
+        self.db.execute('alter table {} drop column {}'.format(table, column))
 
     def insert(self, table, row):
         params = self.validate_types(row)
         placeholders = [':{}'.format(k) for k in row]
 
-        self.db.modify('insert into {}({}) values({})'.format(
+        self.db.execute('insert into {}({}) values({})'.format(
             table, ', '.join(row), ', '.join(placeholders)), params)
 
     def update(self, table, set_dict, where_dict):
@@ -205,24 +203,20 @@ class Database:
         first = ', '.join('{}=:{}_set'.format(k, k) for k in set_dict)
         second = ' and '.join('{}=:{}_where'.format(k, k) for k in where_dict)
 
-        self.db.modify('update {} set {} where {}'.format(
+        self.db.execute('update {} set {} where {}'.format(
             table, first, second), params)
 
     def delete(self, table, where):
         params = self.validate_types(where)
         where = ' and '.join('{}=:{}'.format(k, k) for k in params)
 
-        self.db.modify('delete from {} where {}'.format(table, where), params)
+        self.db.execute('delete from {} where {}'.format(table, where), params)
 
 
 def main():
     logging.basicConfig(format='%(asctime)s %(process)d : %(message)s')
 
     args = argparse.ArgumentParser()
-
-    args.add_argument(
-        '--config', default='config.json',
-        help='Object bucket configuration')
 
     args.add_argument('--db', help='Database Name')
     args.add_argument('--table', help='Table Name')
@@ -238,11 +232,10 @@ def main():
 
     args = args.parse_args()
 
-    with open(args.config) as fd:
-        conf = json.load(fd)
-
-    db = Database(args.db, conf['s3bucket'], conf['s3bucket_auth_key'],
-                  conf['s3bucket_auth_secret'])
+    db = Database(args.db, os.environ['SQLITEDB_S3_ENDPOINT'],
+                  os.environ['SQLITEDB_S3_BUCKET'],
+                  os.environ['SQLITEDB_S3_AUTH_KEY'],
+                  os.environ['SQLITEDB_S3_AUTH_SECRET'])
 
     if 'create_table' == args.operation:
         db.create_table(args.table, args.primary_key.split(','))
