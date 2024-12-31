@@ -134,6 +134,7 @@ class CoreDB:
             self.lsn += 1
 
         log('initialized(%s.sqlite3) lsn(%d)', self.db, self.lsn)
+        return self.lsn
 
 
 class Database:
