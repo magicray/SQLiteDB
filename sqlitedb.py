@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import time
+import uuid
 import boto3
 import base64
 import sqlite3
@@ -49,7 +50,11 @@ class CoreDB:
         self.lsn = None
         self.txns = list()
 
-        self.conn = sqlite3.connect(db + '.sqlite3')
+        self.path = 'SQLiteDB/{}/{}'.format(endpoint.split('/')[-1], bucket)
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self.path = os.path.join(self.path, db)
+
+        self.conn = sqlite3.connect(self.path + '.sqlite3')
         self.conn.execute('PRAGMA journal_mode=WAL')
         self.conn.execute('PRAGMA synchronous=NORMAL')
         self.conn.execute('''create table if not exists _kv(
@@ -78,11 +83,13 @@ class CoreDB:
                 if 'b' == k[0]:
                     params[k] = base64.b64encode(v).decode()
 
-        octets = json.dumps(txns, indent=4, sort_keys=True)
+        if txns:
+            octets = json.dumps(txns, indent=4, sort_keys=True)
 
-        self.s3.put('SQLiteDB/{}/logs/{}'.format(self.db, lsn+1), octets)
-        self.conn.execute("update _kv set value=? where key='lsn'", [lsn+1])
-        self.conn.commit()
+            self.s3.put('SQLiteDB/{}/logs/{}'.format(self.db, lsn+1), octets)
+            self.conn.execute("update _kv set value=? where key='lsn'",
+                              [lsn+1])
+            self.conn.commit()
 
         self.lsn, self.txns = lsn+1, list()
 
@@ -136,6 +143,26 @@ class CoreDB:
         log('initialized(%s.sqlite3) lsn(%d)', self.db, self.lsn)
         return self.lsn
 
+    def snapshot(self):
+        self.sync()
+
+        cur = self.conn.execute("select value from _kv where key='lsn'")
+        lsn = int(cur.fetchall()[0][0])
+        self.conn.rollback()
+
+        filename = self.path + '.snapshot.{}'.format(uuid.uuid4())
+
+        snapshot = sqlite3.connect(filename)
+        self.conn.backup(snapshot, pages=1024)
+        snapshot.close()
+
+        with open(filename, 'rb') as fd:
+            octets = fd.read()
+
+        self.s3.put('SQLiteDB/{}/snapshots/{}'.format(self.db, lsn), octets)
+
+        os.remove(filename)
+
 
 class Database:
     def __init__(self, db, endpoint, bucket, auth_key, auth_secret):
@@ -145,6 +172,12 @@ class Database:
 
     def commit(self):
         self.db.commit()
+
+    def sync(self):
+        self.db.sync()
+
+    def snapshot(self):
+        self.db.snapshot()
 
     def validate_types(self, values):
         PYTYPES = dict(i=(int,), f=(int, float), t=(str,), b=(str, bytes))
@@ -224,7 +257,8 @@ def main():
     args.add_argument('operation', help='Operation to be done',
                       choices=['create_table', 'drop_table', 'add_column',
                                'rename_column', 'drop_column',
-                               'insert', 'update', 'delete', 'sync'])
+                               'insert', 'update', 'delete',
+                               'sync', 'snapshot'])
 
     args.add_argument('--src', help='Old column name')
     args.add_argument('--dst', help='New column name')
@@ -272,6 +306,8 @@ def main():
                 time.sleep(delay)
                 delay = min(60, 2*delay)
             old = lsn
+    elif 'snapshot' == args.operation:
+        db.snapshot()
     else:
         raise Exception('Invalid Operation : {}'.format(args.operation))
 
